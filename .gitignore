@@ -1,0 +1,6 @@
+/.env
+*.json
+notebooks/_debug_*.py
+notebooks/_verify_*.py
+notebooks/_check_*.py
+notebooks/_setup_*.sql
