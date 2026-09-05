@@ -769,7 +769,196 @@ def test_guardrails():
 
 
 # ===========================================================================
-# CATEGORY 7: HITL (Human-in-the-Loop)
+# CATEGORY 7: NLI Verifier
+# ===========================================================================
+def test_nli_verifier():
+    print(f"\n{BOLD}{CYAN}== 7. NLI Verifier =={RESET}")
+
+    from app.graph_nodes import _get_nli_model
+
+    # --- 7a. NLI model loads ---
+    t0 = time.time()
+    try:
+        model = _get_nli_model()
+        nli_load_ok = model is not None
+    except Exception as e:
+        nli_load_ok = False
+    dt = (time.time() - t0) * 1000
+    record("NLI model loads", "nli", nli_load_ok,
+           1.0 if nli_load_ok else 0.0, 1.0, dt,
+           error=None if nli_load_ok else str(e))
+    if not nli_load_ok:
+        return
+
+    # --- 7b. Entailment: supported claim ---
+    t0 = time.time()
+    e = None
+    try:
+        import numpy as np
+        evidence = "Refund window: 30 days. Approved refunds processed within 5-7 business days."
+        claim = "Your refund will be processed within 5-7 business days."
+        scores = model.predict([(evidence, claim)])
+        probs = np.exp(scores) / np.exp(scores).sum(axis=1, keepdims=True)
+        label_idx = int(probs[0].argmax())
+        entailment_ok = label_idx == 1  # 1 = entailment
+    except Exception as e:
+        entailment_ok = False
+    dt = (time.time() - t0) * 1000
+    record("NLI detects entailment (supported claim)", "nli", entailment_ok,
+           1.0 if entailment_ok else 0.0, 1.0, dt,
+           error=None if entailment_ok else str(e))
+
+    # --- 7c. Contradiction: unsupported claim ---
+    t0 = time.time()
+    e = None
+    try:
+        evidence = "Refund window: 30 days."
+        claim = "You are entitled to a full refund after 90 days."
+        scores = model.predict([(evidence, claim)])
+        probs = np.exp(scores) / np.exp(scores).sum(axis=1, keepdims=True)
+        label_idx = int(probs[0].argmax())
+        # Model may say "contradiction" (0) or "neutral" (2) — both mean unsupported
+        unsupported_ok = label_idx in (0, 2)
+    except Exception as e:
+        unsupported_ok = False
+    dt = (time.time() - t0) * 1000
+    record("NLI detects unsupported claim (contradiction or neutral)", "nli", unsupported_ok,
+           1.0 if unsupported_ok else 0.0, 1.0, dt,
+           error=None if unsupported_ok else str(e))
+
+
+# ===========================================================================
+# CATEGORY 8: JWT Authentication (Real Auth Flow)
+# ===========================================================================
+def test_jwt_auth():
+    print(f"\n{BOLD}{CYAN}== 7. JWT Authentication (Real Auth Flow) =={RESET}")
+
+    from app.auth import issue_token, verify_token
+    from app.graph_nodes import build_graph, AgentState
+    from langgraph.checkpoint.memory import MemorySaver
+    from langchain_core.messages import HumanMessage
+
+    # --- 7a. Token issue and verify works ---
+    t0 = time.time()
+    try:
+        token = issue_token("dave", "agent123")
+        claims = verify_token(token)
+        auth_ok = claims is not None and claims["sub"] == "dave" and claims["role"] == "support_agent"
+    except Exception as e:
+        auth_ok = False
+        claims = None
+    dt = (time.time() - t0) * 1000
+    record("Issue and verify JWT", "jwt_auth", auth_ok,
+           1.0 if auth_ok else 0.0, 1.0, dt,
+           details=f"Claims: {claims}" if claims else "Token issue/verify failed",
+           error=None if auth_ok else "JWT issue/verify failed")
+
+    # --- 7b. Invalid token rejected ---
+    t0 = time.time()
+    try:
+        invalid_claims = verify_token("invalid-token-12345")
+        invalid_ok = invalid_claims is None
+    except Exception as e:
+        invalid_ok = False
+    dt = (time.time() - t0) * 1000
+    record("Invalid token rejected", "jwt_auth", invalid_ok,
+           1.0 if invalid_ok else 0.0, 1.0, dt,
+           error=None if invalid_ok else "Invalid token was accepted")
+
+    # --- 7c. Wrong password rejected ---
+    t0 = time.time()
+    try:
+        bad_token = issue_token("dave", "wrongpassword")
+        wrong_pw_ok = bad_token is None
+    except Exception as e:
+        wrong_pw_ok = False
+    dt = (time.time() - t0) * 1000
+    record("Wrong password rejected", "jwt_auth", wrong_pw_ok,
+           1.0 if wrong_pw_ok else 0.0, 1.0, dt,
+           error=None if wrong_pw_ok else "Wrong password was accepted")
+
+    # --- 7d. Graph resolve_role_node with valid token ---
+    t0 = time.time()
+    try:
+        graph = build_graph(checkpointer=MemorySaver())
+        token = issue_token("dave", "agent123")
+        config = {"configurable": {"thread_id": "test-auth-1"}}
+        result = graph.invoke(
+            {
+                "messages": [HumanMessage(content="Test query")],
+                "query": "Test query",
+                "token": token,
+                "role": "",
+                "user_id": "",
+                "token_valid": False,
+                "needs_sql": False,
+                "needs_policy": False,
+                "ticket_ref": None,
+                "sql_result": {},
+                "policy_results": [],
+                "draft_email": "",
+                "risk": {},
+                "approved": False,
+                "final_status": "",
+                "thread_id": "test-auth-1",
+                "nli_verdict": "",
+                "nli_score": 0.0,
+                "nli_retried": False,
+            },
+            config=config,
+        )
+        role_ok = result.get("role") == "support_agent" and result.get("user_id") == "dave"
+    except Exception as e:
+        role_ok = False
+        result = {}
+    dt = (time.time() - t0) * 1000
+    record("Graph resolve_role_node (valid token)", "jwt_auth", role_ok,
+           1.0 if role_ok else 0.0, 1.0, dt,
+           details=f"role={result.get('role')}, user_id={result.get('user_id')}",
+           error=None if role_ok else f"Expected role=support_agent, user_id=dave")
+
+    # --- 7e. Graph reject_node with invalid token ---
+    t0 = time.time()
+    try:
+        graph = build_graph(checkpointer=MemorySaver())
+        config = {"configurable": {"thread_id": "test-auth-2"}}
+        result = graph.invoke(
+            {
+                "messages": [HumanMessage(content="Test query")],
+                "query": "Test query",
+                "token": "invalid-token-xyz",
+                "role": "",
+                "user_id": "",
+                "token_valid": False,
+                "needs_sql": False,
+                "needs_policy": False,
+                "ticket_ref": None,
+                "sql_result": {},
+                "policy_results": [],
+                "draft_email": "",
+                "risk": {},
+                "approved": False,
+                "final_status": "",
+                "thread_id": "test-auth-2",
+                "nli_verdict": "",
+                "nli_score": 0.0,
+                "nli_retried": False,
+            },
+            config=config,
+        )
+        rejected_ok = "REJECTED" in result.get("final_status", "")
+    except Exception as e:
+        rejected_ok = False
+        result = {}
+    dt = (time.time() - t0) * 1000
+    record("Graph reject_node (invalid token)", "jwt_auth", rejected_ok,
+           1.0 if rejected_ok else 0.0, 1.0, dt,
+           details=f"final_status={result.get('final_status', '')[:60]}",
+           error=None if rejected_ok else "Graph did not reject invalid token")
+
+
+# ===========================================================================
+# CATEGORY 8: HITL (Human-in-the-Loop)
 # ===========================================================================
 def test_hitl():
     print(f"\n{BOLD}{CYAN}== 7. Human-in-the-Loop =={RESET}")
@@ -1000,6 +1189,8 @@ def main():
     test_infrastructure()
     test_database_rls()
     test_vector_search()
+    test_jwt_auth()
+    test_nli_verifier()
     test_hitl()
 
     if not args.skip_llm:
