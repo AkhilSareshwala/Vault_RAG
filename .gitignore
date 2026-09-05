@@ -1,5 +1,9 @@
 /.env
 *.json
+__pycache__/
+*.pyc
+*.pyo
+
 notebooks/_debug_*.py
 notebooks/_verify_*.py
 notebooks/_check_*.py
