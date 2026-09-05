@@ -35,6 +35,26 @@ services:
       timeout: 5s
       retries: 5
 
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: vaultrag_api
+    ports:
+      - "8000:8000"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      DATABASE_URL: postgresql://vaultrag_app:postgres@postgres:5432/vaultrag
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pg_data:
     driver: local
