@@ -1,9 +1,30 @@
-/.env
-*.json
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.pytest_cache/
+*.log
+test_report.json
 
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+*.local
+
+# IDEs & System
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary Notebooks
 notebooks/_debug_*.py
 notebooks/_verify_*.py
 notebooks/_check_*.py
