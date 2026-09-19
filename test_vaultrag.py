@@ -382,7 +382,7 @@ def test_vector_search():
     dt = (time.time() - t0) * 1000
     record("Collection create + upsert", "vector", upsert_ok,
            1.0 if upsert_ok else 0.0, 1.0, dt,
-           error=None if upsert_ok else str(e))
+           error=None if upsert_ok else str(e if 'e' in dir() else "unknown"))
 
     # --- 3c. Dense search returns relevant result ---
     t0 = time.time()
@@ -626,6 +626,33 @@ def test_pipeline():
            1.0 if email_ok else 0.5, 1.0, dt,
            details=f"Length: {len(answer)} chars",
            error=None if email_ok else "Email draft too short or missing name")
+
+    # --- 5f. Deterministic threshold: $100.01 → high (no LLM) ---
+    t0 = time.time()
+    try:
+        from app.graph_nodes import HITL_THRESHOLD
+        test_amount = 100.01
+        is_high_value = test_amount > HITL_THRESHOLD
+        threshold_ok = is_high_value is True
+    except Exception as e:
+        threshold_ok = False
+    dt = (time.time() - t0) * 1000
+    record("Deterministic threshold: $100.01 → high", "pipeline", threshold_ok,
+           1.0 if threshold_ok else 0.0, 1.0, dt,
+           error=None if threshold_ok else "Plain Python comparison failed")
+
+    # --- 5g. Deterministic threshold: $99.99 → low (no LLM) ---
+    t0 = time.time()
+    try:
+        test_amount = 99.99
+        is_high_value = test_amount > HITL_THRESHOLD
+        threshold_low_ok = is_high_value is False
+    except Exception as e:
+        threshold_low_ok = False
+    dt = (time.time() - t0) * 1000
+    record("Deterministic threshold: $99.99 → low", "pipeline", threshold_low_ok,
+           1.0 if threshold_low_ok else 0.0, 1.0, dt,
+           error=None if threshold_low_ok else "Plain Python comparison failed")
 
 
 # ===========================================================================

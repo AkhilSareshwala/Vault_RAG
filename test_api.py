@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import json
+import psycopg2
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -131,20 +132,40 @@ def main():
         test("Resume non-existent thread returns 404", False, str(e))
 
     # --- High-value ticket query (should interrupt) ---
+    # Get a real high-value ticket from the database
+    conn = psycopg2.connect(
+        host="localhost", port=5434, dbname="vaultrag",
+        user="postgres", password="postgres",
+    )
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, customer_name, disputed_balance FROM customer_tickets "
+        "WHERE support_agent_id = 'dave' AND disputed_balance > 100 "
+        "ORDER BY disputed_balance DESC LIMIT 1"
+    )
+    high_value = cur.fetchone()
+    conn.close()
+
+    high_value_id = high_value[0] if high_value else None
+    high_value_name = high_value[1] if high_value else "unknown"
+    high_value_amount = float(high_value[2]) if high_value else 0
+
     t0 = time.time()
     try:
-        headers = {"Authorization": f"Bearer {token}"}
+        r = client.post("/login", json={"username": "dave", "password": "agent123"})
+        dave_token = r.json()["token"]
+        headers = {"Authorization": f"Bearer {dave_token}"}
         r = client.post("/query", json={
-            "query": "Carol White on ticket T1010 has a $275 disputed balance on damaged goods.",
-            "ticket_ref": "T1010",
-        }, headers=headers)
+            "query": f"{high_value_name} on ticket {high_value_id} has a ${high_value_amount:.0f} disputed balance. Please resolve.",
+            "ticket_ref": high_value_id,
+        }, headers=headers, timeout=120)
         data = r.json()
         hitl_ok = (
             r.status_code == 200
             and data.get("interrupted") is True
             and data.get("interrupt_payload") is not None
         )
-        test("High-value ticket triggers HITL interrupt", hitl_ok,
+        test(f"High-value ticket (${high_value_amount:.0f}) triggers HITL interrupt", hitl_ok,
              f"interrupted: {data.get('interrupted')}, payload: {bool(data.get('interrupt_payload'))}")
         hitl_thread = data.get("thread_id", "")
     except Exception as e:
@@ -168,6 +189,93 @@ def main():
              f"final_status: {data.get('final_status', '')[:60]}")
     except Exception as e:
         test("Resume with approval sends email", False, str(e))
+
+    # ===================================================================
+    # RLS tests — real Postgres, live API path
+    # ===================================================================
+    print(f"\n{BOLD}  -- RLS Enforcement (live Postgres) --{RESET}")
+
+    # Get real ticket IDs from the database
+    conn = psycopg2.connect(
+        host="localhost", port=5434, dbname="vaultrag",
+        user="postgres", password="postgres",
+    )
+    cur = conn.cursor()
+    cur.execute("SELECT id, support_agent_id, customer_name FROM customer_tickets WHERE support_agent_id = 'dave' LIMIT 1")
+    dave_ticket = cur.fetchone()
+    cur.execute("SELECT id, support_agent_id, customer_name FROM customer_tickets WHERE support_agent_id = 'erin' LIMIT 1")
+    erin_ticket = cur.fetchone()
+    conn.close()
+
+    dave_ticket_id = dave_ticket[0] if dave_ticket else None
+    erin_ticket_id = erin_ticket[0] if erin_ticket else None
+    erin_ticket_name = erin_ticket[2] if erin_ticket else "unknown"
+
+    # --- RLS 1: Dave cannot see Erin's ticket ---
+    t0 = time.time()
+    try:
+        r = client.post("/login", json={"username": "dave", "password": "agent123"})
+        dave_token = r.json()["token"]
+        headers = {"Authorization": f"Bearer {dave_token}"}
+        r = client.post("/query", json={
+            "query": f"Show me ticket {erin_ticket_id}",
+            "ticket_ref": erin_ticket_id,
+        }, headers=headers, timeout=120)
+        data = r.json()
+        # RLS blocks → 0 rows returned → refund_amount stays at 0
+        rls_blocked = (
+            r.status_code == 200
+            and data.get("risk", {}).get("refund_amount", -1) == 0.0
+        )
+        test(f"RLS: Dave blocked from Erin's ticket ({erin_ticket_id[:8]}...)",
+             rls_blocked,
+             f"refund_amount: {data.get('risk', {}).get('refund_amount')}")
+    except Exception as e:
+        test(f"RLS: Dave blocked from Erin's ticket", False, str(e))
+
+    # --- RLS 2: Dave CAN see his own ticket ---
+    t0 = time.time()
+    try:
+        r = client.post("/login", json={"username": "dave", "password": "agent123"})
+        dave_token = r.json()["token"]
+        headers = {"Authorization": f"Bearer {dave_token}"}
+        r = client.post("/query", json={
+            "query": f"Show me ticket {dave_ticket_id}",
+            "ticket_ref": dave_ticket_id,
+        }, headers=headers, timeout=120)
+        data = r.json()
+        # Real data returned → refund_amount > 0 (from actual Postgres row)
+        has_data = (
+            r.status_code == 200
+            and data.get("risk", {}).get("refund_amount", 0) > 0
+        )
+        test(f"RLS: Dave can see own ticket ({dave_ticket_id[:8]}...)",
+             has_data,
+             f"refund_amount: {data.get('risk', {}).get('refund_amount')}")
+    except Exception as e:
+        test(f"RLS: Dave can see own ticket", False, str(e))
+
+    # --- RLS 3: Frank (admin) CAN see Erin's ticket ---
+    t0 = time.time()
+    try:
+        r = client.post("/login", json={"username": "frank", "password": "admin123"})
+        frank_token = r.json()["token"]
+        headers = {"Authorization": f"Bearer {frank_token}"}
+        r = client.post("/query", json={
+            "query": f"Show me ticket {erin_ticket_id}",
+            "ticket_ref": erin_ticket_id,
+        }, headers=headers, timeout=120)
+        data = r.json()
+        # Admin sees all → refund_amount > 0
+        admin_ok = (
+            r.status_code == 200
+            and data.get("risk", {}).get("refund_amount", 0) > 0
+        )
+        test(f"RLS: Frank (admin) sees Erin's ticket ({erin_ticket_id[:8]}...)",
+             admin_ok,
+             f"refund_amount: {data.get('risk', {}).get('refund_amount')}")
+    except Exception as e:
+        test(f"RLS: Frank (admin) sees Erin's ticket", False, str(e))
 
     # --- Summary ---
     total = passed + failed

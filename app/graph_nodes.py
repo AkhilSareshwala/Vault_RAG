@@ -149,36 +149,86 @@ def simple_policy_search(query, top_k=3):
 
 
 # ---------------------------------------------------------------------------
-# Mock ticket database
+# Real Postgres ticket lookup (RLS enforced at database level)
 # ---------------------------------------------------------------------------
-MOCK_TICKETS = {
-    "T1001": {"id": "T1001", "customer_name": "Alice Smith",
-              "region": "us-east", "support_agent_id": "dave",
-              "disputed_balance": 45.00, "ticket_status": "open",
-              "issue_summary": "Refund not received after 30 days"},
-    "T1005": {"id": "T1005", "customer_name": "Bob Johnson",
-              "region": "us-west", "support_agent_id": "dave",
-              "disputed_balance": 150.00, "ticket_status": "pending",
-              "issue_summary": "Wrong item shipped, wants full refund"},
-    "T1010": {"id": "T1010", "customer_name": "Carol White",
-              "region": "eu-west", "support_agent_id": "dave",
-              "disputed_balance": 275.00, "ticket_status": "escalated",
-              "issue_summary": "Damaged goods, subscription charge after cancellation"},
-}
+import psycopg2
+
+_DB_URL = os.environ.get("DATABASE_URL", "")
+_RLS_DB_URL = _DB_URL.replace("postgres:postgres@", "vaultrag_app:postgres@", 1) if _DB_URL else ""
 
 
-def parameterized_ticket_lookup(ticket_ref, agent_id):
-    """Look up a ticket using parameterized values."""
-    if not ticket_ref:
-        results = [t for t in MOCK_TICKETS.values() if t["support_agent_id"] == agent_id]
-        return {"rows": results, "count": len(results)}
+def rls_ticket_lookup(ticket_ref, role, user_id):
+    """Query customer_tickets through real Postgres RLS with fallback for offline DB.
 
-    ticket = MOCK_TICKETS.get(ticket_ref)
-    if ticket and ticket["support_agent_id"] == agent_id:
-        return {"rows": [ticket], "count": 1}
-    elif ticket and ticket["support_agent_id"] != agent_id:
-        return {"rows": [], "count": 0, "rls_blocked": True}
-    return {"rows": [], "count": 0, "not_found": True}
+    Connects as vaultrag_app (NOBYPASSRLS), sets session variables from
+    the verified JWT claims, then runs a parameterized SELECT. Postgres
+    RLS policies enforce access control — no app-level filter needed.
+    If database is unreachable, safely returns fallback demo data according
+    to the user's role.
+    """
+    if _RLS_DB_URL:
+        try:
+            conn = psycopg2.connect(_RLS_DB_URL, connect_timeout=3)
+            try:
+                conn.autocommit = False
+                cur = conn.cursor()
+
+                # Set RLS context from verified JWT claims
+                cur.execute('SET LOCAL "app.current_role" = %s', (role,))
+                cur.execute('SET LOCAL "app.current_user_id" = %s', (user_id,))
+                cur.execute('SET LOCAL "request.jwt.agent_id" = %s', (user_id,))
+                cur.execute('SET LOCAL "request.jwt.role" = %s', (role,))
+
+                if ticket_ref:
+                    cur.execute(
+                        "SELECT id, customer_name, customer_email, region, support_agent_id, "
+                        "disputed_balance, ticket_status, issue_summary "
+                        "FROM customer_tickets WHERE id = %s",
+                        (ticket_ref,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, customer_name, customer_email, region, support_agent_id, "
+                        "disputed_balance, ticket_status, issue_summary "
+                        "FROM customer_tickets"
+                    )
+
+                columns = [desc[0] for desc in cur.description]
+                rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+                for row in rows:
+                    if "disputed_balance" in row:
+                        row["disputed_balance"] = float(row["disputed_balance"])
+
+                conn.rollback()
+                return {"rows": rows, "count": len(rows)}
+            except Exception as e:
+                conn.rollback()
+                return {"rows": [], "count": 0, "error": str(e)}
+            finally:
+                conn.close()
+        except Exception:
+            pass  # DB connection failed, fall through to RLS-aware fallback demo store
+
+    # Fallback demo tickets with RLS logic when live Postgres container is offline
+    DEMO_STORE = [
+        {"id": "T1001", "customer_name": "Alice Smith", "customer_email": "alice@example.com", "region": "US-East", "support_agent_id": "dave", "disputed_balance": 45.0, "ticket_status": "open", "issue_summary": "$45 refund not received"},
+        {"id": "T1002", "customer_name": "Bob Johnson", "customer_email": "bob@example.com", "region": "US-West", "support_agent_id": "dave", "disputed_balance": 150.0, "ticket_status": "open", "issue_summary": "$150 disputed balance"},
+        {"id": "T1003", "customer_name": "Charlie Davis", "customer_email": "charlie@example.com", "region": "EU-Central", "support_agent_id": "dave", "disputed_balance": 75.0, "ticket_status": "open", "issue_summary": "$75 damage claim"},
+        {"id": "T1004", "customer_name": "Diana Prince", "customer_email": "diana@example.com", "region": "AP-South", "support_agent_id": "erin", "disputed_balance": 120.0, "ticket_status": "open", "issue_summary": "$120 supervisory escalation"},
+    ]
+
+    # RLS Filter Simulation
+    visible_rows = []
+    for row in DEMO_STORE:
+        # Dave only sees his own tickets
+        if role == "support_agent" and row["support_agent_id"] != user_id:
+            continue
+        # Filter by ticket_ref if provided
+        if ticket_ref and row["id"] != ticket_ref:
+            continue
+        visible_rows.append(row)
+
+    return {"rows": visible_rows, "count": len(visible_rows), "fallback": True}
 
 
 # ---------------------------------------------------------------------------
@@ -207,24 +257,24 @@ Return only valid JSON:
 
 
 def sql_agent(state):
-    """Agent 2: look up ticket data using parameterized lookup."""
+    """Agent 2: look up ticket data from real Postgres with RLS enforced.
+
+    Connects as vaultrag_app, sets RLS context from verified JWT claims
+    (state['role'], state['user_id'] — set by resolve_role_node), and
+    runs a parameterized SELECT. Postgres RLS policies enforce which rows
+    are visible — no app-level filter is applied here.
+    """
     if not state.get("needs_sql"):
         return {"sql_result": {}, "messages": [AIMessage(content="SQL: skipped")]}
 
     ticket_ref = state.get("ticket_ref")
-    agent_id = state.get("user_id", "dave")
+    role = state.get("role", "")
+    user_id = state.get("user_id", "")
 
-    prompt = f"""For this support query, what database lookup is needed?
-Query: {state['query']}
-Ticket reference: {ticket_ref}
-Agent ID: {agent_id}
-
-Return JSON: {{"query_type": "single_ticket" or "all_agent_tickets", "ticket_id": "{ticket_ref}"}}"""
-
-    plan = call_llm_json(prompt)
-    sql_result = parameterized_ticket_lookup(
-        ticket_ref=plan.get("ticket_id") or ticket_ref,
-        agent_id=agent_id,
+    sql_result = rls_ticket_lookup(
+        ticket_ref=ticket_ref,
+        role=role,
+        user_id=user_id,
     )
 
     return {
@@ -389,37 +439,65 @@ HITL_THRESHOLD = 100.0
 
 
 def risk_assessor(state):
-    """Agent 4: evaluate draft for risk. High risk routes to human approval."""
+    """Evaluate risk with two independent checks:
+
+    1. DETERMINISTIC: refund_amount > HITL_THRESHOLD → hard "high".
+       This is a plain Python comparison. No LLM involved. Cannot be
+       overridden, talked around, or misjudged.
+
+    2. LLM AMBIGUITY: only for the genuinely fuzzy part — whether the
+       policy application is ambiguous or the draft makes unsupported
+       claims. This is independent of the threshold check.
+
+    Final risk_level = "high" if EITHER check triggers.
+    """
     sql = state.get("sql_result", {})
     rows = sql.get("rows", [])
     refund_amount = float(rows[0].get("disputed_balance", 0) or 0) if rows else 0.0
 
-    prompt = f"""Assess the risk of this refund resolution draft.
+    # Check 1: Deterministic threshold — plain Python, no LLM
+    is_high_value = refund_amount > HITL_THRESHOLD
+
+    # Check 2: LLM ambiguity check — only the fuzzy part
+    prompt = f"""Review this refund resolution draft for policy ambiguity.
 
 Draft:
 {state.get('draft_email', 'No draft.')}
 
 Refund amount: ${refund_amount:.2f}
-Threshold: ${HITL_THRESHOLD:.2f}
 Policy evidence was retrieved: {bool(state.get('policy_results'))}
 
-Mark as HIGH risk if:
-- Refund exceeds the threshold, or
-- The draft makes a promise not clearly supported by the policy evidence, or
-- The policy application is ambiguous.
-
-Otherwise mark LOW.
+Focus ONLY on whether the policy application is ambiguous or the draft
+makes claims not clearly supported by the evidence. Do NOT consider the
+refund amount — that is handled separately.
 
 Return only valid JSON:
-{{"risk_level": "low", "refund_amount": {refund_amount}, "reason": "brief explanation"}}"""
+{{"policy_ambiguous": true_or_false, "reason": "brief explanation"}}"""
 
-    result = call_llm_json(prompt)
-    if "error" in result:
-        result = {"risk_level": "high", "refund_amount": refund_amount, "reason": "parse failure"}
+    llm_result = call_llm_json(prompt)
+    policy_ambiguous = bool(llm_result.get("policy_ambiguous", False))
+    if "error" in llm_result:
+        policy_ambiguous = True  # parse failure → treat as ambiguous
+
+    # Combine: high if EITHER check triggers
+    risk_level = "high" if (is_high_value or policy_ambiguous) else "low"
+    reason_parts = []
+    if is_high_value:
+        reason_parts.append(f"Refund ${refund_amount:.2f} exceeds ${HITL_THRESHOLD:.2f} threshold")
+    if policy_ambiguous:
+        reason_parts.append(f"Policy ambiguity: {llm_result.get('reason', 'unspecified')}")
+
+    result = {
+        "risk_level": risk_level,
+        "refund_amount": refund_amount,
+        "is_high_value": is_high_value,
+        "policy_ambiguous": policy_ambiguous,
+        "reason": "; ".join(reason_parts) if reason_parts else "Within threshold, no ambiguity",
+    }
 
     return {
         "risk": result,
-        "messages": [AIMessage(content=f"Risk: {result.get('risk_level')} -- {result.get('reason')}")],
+        "messages": [AIMessage(content=f"Risk: {risk_level} (threshold={is_high_value}, ambiguity={policy_ambiguous})")],
     }
 
 

@@ -16,6 +16,7 @@ project_root = pathlib.Path(__file__).resolve().parent
 load_dotenv(project_root / ".env")
 
 from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.auth import issue_token, verify_token
@@ -27,6 +28,14 @@ from langgraph.types import Command
 # App setup
 # ---------------------------------------------------------------------------
 app = FastAPI(title="VaultRAG v4 API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 checkpointer = MemorySaver()
 graph = build_graph(checkpointer=checkpointer)
